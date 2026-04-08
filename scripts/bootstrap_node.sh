@@ -89,7 +89,9 @@ def exists_v2(name):
         return False
 
 def fetch(key):
-    name = key.rstrip("/").split("/")[-2] if use_r2 else key.rsplit("/",1)[-1].replace(".npz","")
+    # HF rfilename format: tornet_<id>_<tag>/sequence.npz  -> name is the first dir
+    # R2 key format: stormlibre/datasets/tornet-temporal/tornet_<id>_<tag>/sequence.npz
+    name = key.rstrip("/").split("/")[-2]
     # cheap skip
     if exists_v2(name):
         return name, "skip_done"
