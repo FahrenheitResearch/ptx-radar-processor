@@ -67,24 +67,13 @@ r2 = boto3.client("s3",
     config=Config(signature_version="s3v4", retries={"max_attempts": 5}),
     region_name="auto")
 
-# List events from R2 mirror (preferred) or HF
-events = []
-try:
-    paginator = r2.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket="wrf-era5", Prefix="stormlibre/datasets/tornet-temporal/"):
-        for obj in page.get("Contents") or []:
-            if obj["Key"].endswith("/sequence.npz"):
-                events.append(obj["Key"])
-    if not events:
-        raise RuntimeError("R2 mirror empty")
-    print(f"using R2 mirror: {len(events)} events")
-    use_r2 = True
-except Exception as e:
-    print(f"R2 mirror unavailable ({e}); falling back to HF")
-    api = HfApi()
-    info = api.dataset_info("deepguess/tornet-temporal")
-    events = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".npz"))
-    use_r2 = False
+# Always use HF as the canonical shard pool — R2 mirror is incomplete and
+# would cause a double-sharding bug if we slice from it.
+api = HfApi()
+info = api.dataset_info("deepguess/tornet-temporal")
+events = sorted(s.rfilename for s in info.siblings if s.rfilename.endswith(".npz"))
+use_r2 = False
+print(f"HF dataset: {len(events)} events")
 
 events.sort()
 my_events = events[shard::nshards]
