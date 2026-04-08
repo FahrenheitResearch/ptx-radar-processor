@@ -18,7 +18,7 @@ set -euo pipefail
 : "${R2_SECRET:?must set R2_SECRET}"
 : "${SHARD_IDX:?must set SHARD_IDX}"
 : "${NUM_SHARDS:?must set NUM_SHARDS}"
-WORKERS="${WORKERS:-32}"
+WORKERS="${WORKERS:-24}"
 
 export R2_KEY R2_SECRET
 
@@ -85,8 +85,11 @@ def exists_v2(name):
         r2.head_object(Bucket="wrf-era5",
                        Key=f"stormlibre/datasets/tornet-temporal-v2/{name}/sequence.npz")
         return True
-    except ClientError:
-        return False
+    except ClientError as e:
+        code = str(e.response.get("Error", {}).get("Code", ""))
+        if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
 
 def fetch(key):
     # HF rfilename format: tornet_<id>_<tag>/sequence.npz  -> name is the first dir
@@ -120,9 +123,10 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 print(f"done fetching shard")
 PY
 
-# 5. run reprocess for this shard, streaming straight to R2
+# 5. run reprocess for everything on disk (the bootstrap fetcher already
+#    filtered to this shard, so reprocess must NOT shard again — it would
+#    double-shard the already-sharded disk listing).
 cd /root
 exec python3 reprocess_tornet.py \
     --workers "$WORKERS" \
-    --shard "$SHARD_IDX" --num-shards "$NUM_SHARDS" \
     --upload-r2
