@@ -612,6 +612,51 @@ std::string bytesToSize(size_t bytes) {
     return stream.str();
 }
 
+
+bool uploadAndRenderFloat(const WorkingSet& working_set,
+                          const ProcessorOptions& options,
+                          float* d_output_float,
+                          std::vector<float>& host_floats,
+                          std::string& error) {
+    const int available_tilts = countProductSweeps(working_set.sweeps, options.product);
+    if (available_tilts <= 0) { error = "Requested product not present"; return false; }
+    if (options.tilt < 0 || options.tilt >= available_tilts) {
+        error = "Requested tilt unavailable";
+        return false;
+    }
+    const int sweep_index = findProductSweep(working_set.sweeps, options.product, options.tilt);
+    if (sweep_index < 0 || sweep_index >= static_cast<int>(working_set.sweeps.size())) {
+        error = "Failed to resolve sweep index";
+        return false;
+    }
+    const auto& sweep = working_set.sweeps[sweep_index];
+    GpuStationInfo info = makeGpuStationInfo(sweep, working_set.station_lat, working_set.station_lon);
+    const uint16_t* gate_ptrs[NUM_PRODUCTS] = {};
+    for (int product = 0; product < NUM_PRODUCTS; ++product) {
+        const auto& product_data = sweep.products[product];
+        if (product_data.has_data && !product_data.gates.empty())
+            gate_ptrs[product] = product_data.gates.data();
+    }
+    gpu::allocateStation(0, info);
+    gpu::uploadStationData(0, info, sweep.azimuths.data(), gate_ptrs);
+
+    GpuViewport viewport = {};
+    viewport.center_lat = static_cast<float>(options.has_center_override ? options.center_lat
+                                                                         : working_set.station_lat);
+    viewport.center_lon = static_cast<float>(options.has_center_override ? options.center_lon
+                                                                         : working_set.station_lon);
+    viewport.deg_per_pixel_x = static_cast<float>(1.0 / options.zoom);
+    viewport.deg_per_pixel_y = static_cast<float>(1.0 / options.zoom);
+    viewport.width = options.width;
+    viewport.height = options.height;
+
+    gpu::forwardRenderStationFloat(viewport, 0, options.product, options.threshold, d_output_float);
+    CUDA_CHECK(cudaMemcpy(host_floats.data(), d_output_float,
+                          host_floats.size() * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+    return true;
+}
+
 } // namespace
 
 bool parseProcessorOptions(int argc, char** argv,
@@ -643,6 +688,23 @@ bool parseProcessorOptions(int argc, char** argv,
                 options.end_time_utc = require_value(index, "--end");
             } else if (arg == "--out") {
                 options.output_dir = require_value(index, "--out");
+            } else if (arg == "--products") {
+                std::string csv = require_value(index, "--products");
+                std::stringstream ss(csv);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    if (tok.empty()) continue;
+                    int p = parseProductToken(tok);
+                    if (p < 0) { error = "Bad --products token: " + tok; return false; }
+                    options.product_list.push_back(p);
+                }
+            } else if (arg == "--tilts") {
+                std::string csv = require_value(index, "--tilts");
+                std::stringstream ss(csv);
+                std::string tok;
+                while (std::getline(ss, tok, ',')) {
+                    if (!tok.empty()) options.tilt_list.push_back(std::stoi(tok));
+                }
             } else if (arg == "--product") {
                 const int product = parseProductToken(require_value(index, "--product"));
                 if (product < 0)
@@ -666,6 +728,8 @@ bool parseProcessorOptions(int argc, char** argv,
                 options.has_center_override = true;
             } else if (arg == "--limit") {
                 options.limit = std::stoi(require_value(index, "--limit"));
+            } else if (arg == "--raw-out") {
+                options.raw_out = true;
             } else if (arg == "--overwrite") {
                 options.overwrite = true;
             } else if (arg == "--no-dealias") {
@@ -725,6 +789,8 @@ std::string processorUsage(const char* argv0) {
         << "Options:\n"
         << "  --out DIR             Output directory (default: output)\n"
         << "  --product TOKEN       REF|VEL|SW|ZDR|CC|KDP|PHI (default: REF)\n"
+        << "  --products LIST       comma-separated product list (overrides --product)\n"
+        << "  --tilts LIST          comma-separated tilt list (overrides --tilt)\n"
         << "  --tilt N              Product tilt index, zero-based (default: 0)\n"
         << "  --width N             Output width in pixels (default: 1024)\n"
         << "  --height N            Output height in pixels (default: 1024)\n"
@@ -733,7 +799,8 @@ std::string processorUsage(const char* argv0) {
         << "  --center-lat LAT      Override viewport center latitude\n"
         << "  --center-lon LON      Override viewport center longitude\n"
         << "  --limit N             Stop after N files (default: unlimited)\n"
-        << "  --overwrite           Re-render files even if PNG already exists\n"
+        << "  --raw-out             Write raw float32 .bin instead of PNG\n"
+        << "  --overwrite           Re-render files even if PNG/raw already exists\n"
         << "  --no-dealias          Disable velocity dealiasing\n"
         << "  --cpu-only            Skip the fast lowest-sweep GPU ingest path\n";
     return usage.str();
@@ -776,11 +843,25 @@ int runProcessor(const ProcessorOptions& options) {
 
     bool gpu_initialized = false;
     uint32_t* d_output = nullptr;
+    float* d_output_float = nullptr;
+    std::vector<float> host_floats(static_cast<size_t>(options.width) * options.height);
     std::vector<uint32_t> host_pixels(static_cast<size_t>(options.width) * options.height);
 
     gpu::init();
     gpu_initialized = true;
+    // Build effective product/tilt combo lists.
+    std::vector<int> effective_products = options.product_list.empty()
+        ? std::vector<int>{options.product}
+        : options.product_list;
+    std::vector<int> effective_tilts = options.tilt_list.empty()
+        ? std::vector<int>{options.tilt}
+        : options.tilt_list;
+    // BATCH_LOOP_MARK
+
     CUDA_CHECK(cudaMalloc(&d_output, host_pixels.size() * sizeof(uint32_t)));
+    if (options.raw_out) {
+        CUDA_CHECK(cudaMalloc(&d_output_float, host_floats.size() * sizeof(float)));
+    }
     CUDA_CHECK(cudaMemset(d_output, 0, host_pixels.size() * sizeof(uint32_t)));
 
     for (size_t index = 0; index < files.size(); ++index) {
@@ -818,24 +899,61 @@ int runProcessor(const ProcessorOptions& options) {
             working_set.station_lon = station->lon;
         }
 
-        if (!uploadAndRender(working_set, options, d_output, host_pixels, error)) {
-            ++counters.failed;
-            std::cout << "  failed: " << error << "\n";
-            continue;
+        bool any_failed = false;
+        bool any_rendered = false;
+        for (int eff_prod : effective_products) {
+            for (int eff_tilt : effective_tilts) {
+                ProcessorOptions per_combo = options;
+                per_combo.product = eff_prod;
+                per_combo.tilt = eff_tilt;
+                std::filesystem::path combo_path =
+                    outputPathForKey(options.output_dir, file.key, eff_prod, eff_tilt);
+                if (options.raw_out) {
+                    combo_path.replace_extension(".bin");
+                }
+                if (!options.overwrite && std::filesystem::exists(combo_path)) {
+                    continue;
+                }
+                if (options.raw_out) {
+                    std::string err2;
+                    if (!uploadAndRenderFloat(working_set, per_combo, d_output_float, host_floats, err2)) {
+                        any_failed = true;
+                        std::cout << "  failed " << productCode(eff_prod) << " T" << eff_tilt << ": " << err2 << "\n";
+                        continue;
+                    }
+                    FILE* fp = fopen(combo_path.string().c_str(), "wb");
+                    if (!fp) { any_failed = true; std::cout << "  failed bin open\n"; continue; }
+                    fwrite(host_floats.data(), sizeof(float), host_floats.size(), fp);
+                    fclose(fp);
+                    any_rendered = true;
+                } else {
+                    std::string err2;
+                    if (!uploadAndRender(working_set, per_combo, d_output, host_pixels, err2)) {
+                        any_failed = true;
+                        continue;
+                    }
+                    if (!writePngFile(combo_path,
+                                      reinterpret_cast<const uint8_t*>(host_pixels.data()),
+                                      options.width, options.height, err2)) {
+                        any_failed = true;
+                        continue;
+                    }
+                    any_rendered = true;
+                }
+            }
         }
-
-        if (!writePngFile(output_path,
-                          reinterpret_cast<const uint8_t*>(host_pixels.data()),
-                          options.width, options.height, error)) {
+        if (any_rendered) {
+            ++counters.rendered;
+            std::cout << "  wrote " << effective_products.size() * effective_tilts.size()
+                      << " channels for " << std::filesystem::path(file.key).filename().string() << "\n";
+        } else if (any_failed) {
             ++counters.failed;
-            std::cout << "  failed: PNG write error: " << error << "\n";
-            continue;
+        } else {
+            ++counters.skipped;
         }
-
-        ++counters.rendered;
-        std::cout << "  wrote " << output_path.filename().string() << "\n";
     }
 
+    if (d_output_float) { cudaFree(d_output_float); d_output_float = nullptr; }
     if (d_output) {
         cudaFree(d_output);
         d_output = nullptr;
@@ -851,5 +969,5 @@ int runProcessor(const ProcessorOptions& options) {
               << " failed=" << counters.failed
               << "\n";
 
-    return counters.failed == 0 ? 0 : 1;
+    return counters.rendered > 0 ? 0 : (counters.failed == 0 ? 0 : 1);
 }

@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 struct ProcessorOptions {
     std::string station;
@@ -15,6 +16,9 @@ struct ProcessorOptions {
     int tilt = 0;
     float threshold = 0.0f;
     bool overwrite = false;
+    bool raw_out = false;
+    std::vector<int> product_list;
+    std::vector<int> tilt_list;
     bool dealias_velocity = true;
     bool cpu_only = false;
     bool has_center_override = false;

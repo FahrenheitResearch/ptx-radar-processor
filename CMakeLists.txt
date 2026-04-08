@@ -76,7 +76,8 @@ if(WIN32)
     target_link_libraries(ptx-radar-processor PRIVATE winhttp ole32 windowscodecs)
 else()
     find_package(CURL REQUIRED)
-    target_link_libraries(ptx-radar-processor PRIVATE CURL::libcurl dl pthread)
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(ptx-radar-processor PRIVATE CURL::libcurl ZLIB::ZLIB dl pthread)
 endif()
 
 set_target_properties(ptx-radar-processor PROPERTIES
