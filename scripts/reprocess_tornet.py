@@ -334,11 +334,14 @@ def main() -> None:
         futs = {pool.submit(render_event, ev, args.upload_r2): ev for ev in events}
         for i, fut in enumerate(as_completed(futs), start=1):
             ev_id, stats = fut.result()
-            if stats.get("status") == "ok":
+            status = stats.get("status")
+            if status == "ok":
                 ok += 1
                 total_render += stats["render_seconds"]
                 total_size_mb += stats["out_size_mb"]
                 total_valid_channels += stats["valid_channels"]
+            elif status == "skip_r2":
+                ok += 1  # already in R2, count as success
             else:
                 fail += 1
                 if fail <= 5:
